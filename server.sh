@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 cd /
-GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone https://github.com/DDantalion/CSE232B.git
-cd CSE232B
+GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone https://github.com/Haardhik3981/CSE231_Adv_OS.git
+cd CSE231_Adv_OS
 git checkout RRIP
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
