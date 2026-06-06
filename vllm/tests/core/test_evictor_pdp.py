@@ -56,6 +56,30 @@ def test_pdp_evicts_expired_block_before_protected_block():
     assert (block_id, content_hash) == (1, 11)
 
 
+def test_pdp_fallback_evicts_inserted_block_with_highest_remaining_pd():
+    evictor = PDPEvictor("pdp_initial_pd=4,pdp_recompute_interval=100")
+
+    evictor.add(1, 11, 16, 1.0, {})
+    evictor.observe_cache_accesses([99], cache_hint={})
+    evictor.add(2, 22, 16, 2.0, {})
+
+    block_id, content_hash = evictor.evict()
+
+    assert (block_id, content_hash) == (2, 22)
+
+
+def test_pdp_fallback_prefers_inserted_blocks_before_reused_blocks():
+    evictor = PDPEvictor("pdp_initial_pd=4,pdp_recompute_interval=100")
+
+    evictor.add(1, 11, 16, 1.0, {})
+    evictor.add(2, 22, 16, 2.0, {})
+    evictor.observe_cache_accesses([11], cache_hint={}, real_hits=[True])
+
+    block_id, content_hash = evictor.evict()
+
+    assert (block_id, content_hash) == (2, 22)
+
+
 def test_pdp_keeps_hash_mapping_consistent_when_blocks_change():
     evictor = PDPEvictor("pdp_initial_pd=2,pdp_recompute_interval=100")
 

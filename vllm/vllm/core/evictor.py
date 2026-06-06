@@ -300,8 +300,11 @@ class PDPEvictor(Evictor):
         remaining = max(0, block.protected_until_epoch - self.request_epoch)
         if expired:
             return (0, block.last_access_epoch, block.last_accessed, block_id)
-        return (1, remaining, block.last_access_epoch, block.last_accessed,
-                block_id)
+        # Inclusive-cache PDP fallback: if no unprotected line exists, evict an
+        # inserted line with the highest remaining PD; if every line has been
+        # reused, evict the reused line with the highest remaining PD.
+        return (1, 1 if block.reused else 0, -remaining,
+                -block.last_access_epoch, -block.last_accessed, block_id)
 
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
