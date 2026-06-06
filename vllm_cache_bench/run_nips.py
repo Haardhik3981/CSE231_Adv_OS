@@ -78,6 +78,12 @@ async def main(sizes,
         {
             'num_prompts': 30000,
             'use_oracle': 0,
+            'use_token_id': 0,
+            'algorithm': 'pdp'
+        },
+        {
+            'num_prompts': 30000,
+            'use_oracle': 0,
             'use_token_id': 1,
             'algorithm': 'scheduler'
         }
@@ -259,6 +265,12 @@ async def main(sizes,
         client_config = copy.deepcopy(client_conf)
         server_config = copy.deepcopy(server_conf)
         server_config['client_algorithm'] = client_config['algorithm']
+        if server_config['client_algorithm'] == 'pdp':
+            server_config['eviction_algorithm'] = 'pdp'
+            server_config['args'] = re.sub(
+                r'--eviction_algorithm\s+\S+',
+                '--eviction_algorithm pdp',
+                server_config['args'])
         if server_config['client_algorithm'] in ('ml', 'scheduler'):
             server_config['size'] -= 250 # 2GB
         print("Starting server configuration:", server_config)
@@ -316,4 +328,3 @@ if __name__ == "__main__":
             for sizes in [[8000]]:
                 for scales in [[1]]:
                     asyncio.run(main(sizes, scales, alg, dataset, 'size++'))
-

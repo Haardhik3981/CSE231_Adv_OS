@@ -10,6 +10,15 @@ from sortedcontainers import SortedDict
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
+def parse_evictor_config(config: str) -> dict:
+    if not config:
+        return {}
+    return {
+        key: value
+        for key, value in (
+            pair.split("=", 1) for pair in config.split(",") if pair)
+    }
+
 def probability_of_future_arrival(prob_has_next, exp_scale, elapsed_time, debug=False):
     if prob_has_next == 0 or exp_scale == 0:
         return 0.0
@@ -119,6 +128,236 @@ class BlockMetaData:
         self.last_accessed = last_accessed
         self.cache_hint = cache_hint
         self.score = score
+
+
+class PDPBlockMetaData(BlockMetaData):
+    """Metadata for PDP's request-epoch based protection window."""
+
+    def __init__(self,
+                 content_hash: int,
+                 num_hashed_tokens: int,
+                 last_accessed: float,
+                 cache_hint: dict = None,
+                 first_access_epoch: int = 0,
+                 last_access_epoch: int = 0,
+                 protected_until_epoch: int = 0,
+                 reused: bool = False):
+        super().__init__(content_hash, num_hashed_tokens, last_accessed,
+                         cache_hint)
+        self.first_access_epoch = first_access_epoch
+        self.last_access_epoch = last_access_epoch
+        self.protected_until_epoch = protected_until_epoch
+        self.reused = reused
+
+
+class PDPEvictor(Evictor):
+    """Protecting Distance based policy adapted for prefix-cache blocks.
+
+    PDP in the MICRO paper uses accesses to a hardware cache set as its time
+    base. Here we use a request-level epoch: every prefix-cache lookup advances
+    the epoch once, and reuse distance is the number of request epochs between
+    two observations of the same prefix block hash.
+    """
+
+    DEFAULT_INITIAL_PD = 32
+    DEFAULT_MAX_DISTANCE = 256
+    DEFAULT_RECOMPUTE_INTERVAL = 512
+    DEFAULT_BUCKET_SIZE = 1
+    DEFAULT_EVICTION_DISTANCE = 1
+
+    def __init__(self, config: str = ""):
+        self.free_table: Dict[int, PDPBlockMetaData] = {}
+        self.content_hash_to_block_id: Dict[int, int] = {}
+        self.last_seen_epoch: Dict[int, int] = {}
+        self.reuse_distance_counts = defaultdict(int)
+        self.config = parse_evictor_config(config)
+        self.protecting_distance = max(
+            0, int(self.config.get("pdp_initial_pd",
+                                   self.DEFAULT_INITIAL_PD)))
+        self.max_distance = max(
+            1, int(self.config.get("pdp_max_distance",
+                                   self.DEFAULT_MAX_DISTANCE)))
+        self.recompute_interval = max(
+            1, int(self.config.get("pdp_recompute_interval",
+                                   self.DEFAULT_RECOMPUTE_INTERVAL)))
+        self.bucket_size = max(
+            1, int(self.config.get("pdp_bucket_size",
+                                   self.DEFAULT_BUCKET_SIZE)))
+        self.eviction_distance = max(
+            1, int(self.config.get("pdp_eviction_distance",
+                                   self.DEFAULT_EVICTION_DISTANCE)))
+        self.capacity = 0
+        self.request_epoch = 0
+        self.total_observed_accesses = 0
+        self.stat = CacheStat()
+
+    def __contains__(self, block_id: int) -> bool:
+        return block_id in self.free_table
+
+    def set_capacity(self, capacity: int):
+        # Kept for parity with other evictors. The protecting-distance formula
+        # uses the separately configurable eviction distance, not total blocks.
+        self.capacity = int(capacity or 0)
+
+    def should_predict_cache_hint(self) -> bool:
+        return False
+
+    def should_observe_cache_accesses(self) -> bool:
+        return True
+
+    def _bucket_distance(self, distance: int) -> int:
+        distance = max(1, min(distance, self.max_distance))
+        if self.bucket_size == 1:
+            return distance
+        return min(self.max_distance,
+                   ((distance + self.bucket_size - 1) //
+                    self.bucket_size) * self.bucket_size)
+
+    def _protect_block(self, block_id: int, reused: bool = True) -> None:
+        if block_id not in self.free_table:
+            return
+        block = self.free_table[block_id]
+        block.last_access_epoch = self.request_epoch
+        block.protected_until_epoch = (
+            self.request_epoch + self.protecting_distance)
+        block.reused = block.reused or reused
+
+    def _forget_hash_mapping(self, content_hash: int, block_id: int) -> None:
+        if self.content_hash_to_block_id.get(content_hash) == block_id:
+            self.content_hash_to_block_id.pop(content_hash, None)
+
+    def observe_cache_accesses(self,
+                               block_hashes: List[int],
+                               cache_hint: Optional[dict] = None,
+                               real_hits: Optional[List[bool]] = None):
+        if not block_hashes:
+            return
+
+        self.request_epoch += 1
+        seen_in_request = set()
+        for index, content_hash in enumerate(block_hashes):
+            if content_hash in seen_in_request:
+                continue
+            seen_in_request.add(content_hash)
+            self.total_observed_accesses += 1
+            real_hit = bool(real_hits[index]) if real_hits else False
+
+            previous_epoch = self.last_seen_epoch.get(content_hash)
+            if previous_epoch is not None:
+                reuse_distance = self.request_epoch - previous_epoch
+                self.reuse_distance_counts[
+                    self._bucket_distance(reuse_distance)] += 1
+
+            self.last_seen_epoch[content_hash] = self.request_epoch
+            block_id = self.content_hash_to_block_id.get(content_hash)
+            if block_id is not None:
+                self._protect_block(block_id,
+                                    reused=real_hit
+                                    or previous_epoch is not None)
+
+        if self.total_observed_accesses % self.recompute_interval == 0:
+            self._recompute_protecting_distance()
+
+    def observe_cache_access(self,
+                             content_hash: int,
+                             cache_hint: Optional[dict] = None,
+                             real_hit: Optional[bool] = None):
+        self.observe_cache_accesses([content_hash], cache_hint,
+                                    [real_hit] if real_hit is not None else None)
+
+    def _recompute_protecting_distance(self):
+        if not self.reuse_distance_counts or self.total_observed_accesses == 0:
+            return
+
+        distances = sorted(self.reuse_distance_counts.items())
+        best_distance = self.protecting_distance
+        best_score = -1.0
+        cumulative_hits = 0
+        cumulative_cost = 0
+        idx = 0
+
+        for distance in range(1, self.max_distance + 1, self.bucket_size):
+            while idx < len(distances) and distances[idx][0] <= distance:
+                reuse_distance, count = distances[idx]
+                cumulative_hits += count
+                cumulative_cost += reuse_distance * count
+                idx += 1
+
+            misses = max(0, self.total_observed_accesses - cumulative_hits)
+            denominator = (
+                cumulative_cost +
+                misses * (distance + self.eviction_distance))
+            score = (cumulative_hits / denominator
+                     if denominator > 0 else 0.0)
+            if score > best_score:
+                best_score = score
+                best_distance = distance
+
+        self.protecting_distance = best_distance
+
+    def _victim_key(self, block_id: int, block: PDPBlockMetaData):
+        expired = block.protected_until_epoch <= self.request_epoch
+        remaining = max(0, block.protected_until_epoch - self.request_epoch)
+        if expired:
+            return (0, block.last_access_epoch, block.last_accessed, block_id)
+        return (1, remaining, block.last_access_epoch, block.last_accessed,
+                block_id)
+
+    def evict(self) -> Tuple[int, int]:
+        if len(self.free_table) == 0:
+            raise ValueError("No usable cache memory left")
+
+        block_id, block = min(self.free_table.items(),
+                              key=lambda item: self._victim_key(
+                                  item[0], item[1]))
+        survival_time = time.time() - block.last_accessed
+        self.stat.append("survival_times", survival_time)
+        content_hash = block.content_hash
+        del self.free_table[block_id]
+        self._forget_hash_mapping(content_hash, block_id)
+        return block_id, content_hash
+
+    def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+            last_accessed: float, cache_hint: dict):
+        previous_block = self.free_table.get(block_id)
+        if previous_block is not None:
+            self._forget_hash_mapping(previous_block.content_hash, block_id)
+
+        last_access_epoch = self.last_seen_epoch.get(content_hash,
+                                                     self.request_epoch)
+        reused = content_hash in self.last_seen_epoch
+        block = PDPBlockMetaData(
+            content_hash=content_hash,
+            num_hashed_tokens=num_hashed_tokens,
+            last_accessed=last_accessed,
+            cache_hint=cache_hint,
+            first_access_epoch=last_access_epoch,
+            last_access_epoch=last_access_epoch,
+            protected_until_epoch=(
+                self.request_epoch + self.protecting_distance),
+            reused=reused,
+        )
+        self.free_table[block_id] = block
+        self.content_hash_to_block_id[content_hash] = block_id
+
+    def update(self, block_id: int, last_accessed: float, cache_hint: dict):
+        if block_id not in self.free_table:
+            raise ValueError("Attempting to update block that's not in the evictor")
+        block = self.free_table[block_id]
+        block.last_accessed = last_accessed
+        block.cache_hint = cache_hint
+        self._protect_block(block_id, reused=True)
+
+    def remove(self, block_id: int):
+        if block_id not in self.free_table:
+            raise ValueError(
+                "Attempting to remove block that's not in the evictor")
+        block = self.free_table.pop(block_id)
+        self._forget_hash_mapping(block.content_hash, block_id)
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.free_table)
 
 
 class ShadowPolicyCache:
@@ -339,9 +578,7 @@ class LRUMLEvictor(Evictor):
         return block_id in self.free_table
 
     def parse_str_to_dict(self, s: str) -> dict:
-        if len(s) == 0:
-            return {}
-        return {key: value for key, value in (pair.split("=", 1) for pair in s.split(","))}
+        return parse_evictor_config(s)
 
     def get_policy(self, cache_hint: dict) -> str:
         if cache_hint is None:
@@ -658,5 +895,7 @@ class LRUEvictor(Evictor):
 def make_evictor(eviction_algorithm: str, config: str) -> Evictor:
     if eviction_algorithm == 'lru':
         return LRUEvictor()
+    if eviction_algorithm == 'pdp':
+        return PDPEvictor(config)
     else:
         return LRUMLEvictor(config)

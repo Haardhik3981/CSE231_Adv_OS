@@ -32,7 +32,7 @@ After cloning the repository, create the benchmark environment and install the
 local vLLM package:
 
 ```bash
-cd CSE232B
+cd CSE231_Adv_OS
 bash vllm_cache_bench/setup_env.sh
 ```
 
@@ -72,6 +72,7 @@ The implementation supports these eviction policies:
 - `lru`: least recently used.
 - `rrip`: RRIP with an aging loop.
 - `fifo`: first in, first out.
+- `pdp`: protecting-distance policy adapted to prefix-cache reuse distance.
 - `scheduler`: warmup-based dynamic selector over LPC (`ml`), `lru`, `rrip`,
   and `fifo`.
 
@@ -145,14 +146,15 @@ decreasing it makes the shadow hit-rate estimate more exact.
 
 ## Running Benchmarks
 
-Run the baseline policy sweep from `run_nips.py`:
+Run the full policy sweep from `run_nips.py`:
 
 ```bash
 cd vllm_cache_bench
 python run_nips.py
 ```
 
-By default this runs `ml`, `lru`, `rrip`, and `fifo` clients on:
+By default this runs `ml`, `lru`, `rrip`, `fifo`, `pdp`, and `scheduler`
+clients on:
 
 ```text
 sharegpt, lmsys, chatbot
@@ -171,6 +173,15 @@ By default `run_scheduler.py` also runs:
 sharegpt, lmsys, chatbot
 ```
 
+Run only the PDP version:
+
+```bash
+cd vllm_cache_bench
+python run_pdp.py
+```
+
+By default `run_pdp.py` runs only `sharegpt`.
+
 Useful scheduler options:
 
 ```bash
@@ -179,6 +190,15 @@ python run_scheduler.py --observe-stride 8
 python run_scheduler.py --datasets sharegpt
 python run_scheduler.py --datasets sharegpt,lmsys,chatbot --sizes 8000 --scales 1
 python run_scheduler.py --small-threshold 0.10 --large-threshold 0.05
+```
+
+Useful PDP options:
+
+```bash
+python run_pdp.py --datasets sharegpt
+python run_pdp.py --datasets sharegpt,lmsys,chatbot --sizes 8000 --scales 1
+python run_pdp.py --initial-pd 32 --max-distance 256
+python run_pdp.py --recompute-interval 512 --bucket-size 1
 ```
 
 Dataset-specific request settings, checkpoint paths, dataset paths, and
